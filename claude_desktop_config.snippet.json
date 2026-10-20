@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nust-lms": {
+      "command": "E:\\Agentic AI projects\\NUST_LMS_MCP\\venv\\Scripts\\python.exe",
+      "args": ["E:\\Agentic AI projects\\NUST_LMS_MCP\\app\\main.py"]
+    }
+  }
+}
