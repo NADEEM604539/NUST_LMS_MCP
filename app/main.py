@@ -53,10 +53,16 @@ mcp = FastMCP(
         "folders on the user's computer, and the user's Filesystem extension "
         "(Claude Desktop > Settings > Extensions > 'Filesystem') decides which "
         "folders Claude may use. Workflow:\n"
-        "  1. DOWNLOAD (download_course_material / download_course_submission): call the "
-        "Filesystem tool list_allowed_directories, choose a folder inside it (ask the "
-        "user if unclear), pass that full path as save_dir, then confirm the file with "
-        "the Filesystem tools (list_directory / get_file_info) or read it.\n"
+        "  1. DOWNLOAD (download_course_material / download_course_materials / "
+        "download_course_submission): call the Filesystem tool "
+        "list_allowed_directories and pass the allowed directory ITSELF as save_dir, "
+        "exactly as it is returned (e.g. 'E:\\NUST_LMS'). That directory is the ROOT: "
+        "the course folders are created directly inside it. NEVER add a subfolder of "
+        "your own such as Downloads, Courses, Materials or the course name, and never "
+        "use the NUST_LMS_MCP project folder (it holds the server's source code). If "
+        "several directories are allowed, use the one the user has designated for "
+        "LMS files, otherwise ask the user once which one. Afterwards confirm the "
+        "file with the Filesystem tools (list_directory / get_file_info) or read it.\n"
         "  2. UPLOAD (upload_course_submission): locate the file with the Filesystem "
         "tools (search_files / list_directory) and pass its exact full path as "
         "file_path.\n"
@@ -68,7 +74,8 @@ mcp = FastMCP(
         "and never create course/lab subfolders yourself: <Course>/ holds lectures and "
         "other material; <Course>/Labs/Lab N/ and <Course>/Assignments/Assignment N/ "
         "hold lab manuals and assignment files; <Course>/Submissions/<Lab N or "
-        "Assignment N>/ holds the user's own submitted work. The tool result gives the "
+        "Assignment N>/ holds the user's own submitted work. This applies to bulk "
+        "downloads exactly as to single files. The tool result gives the "
         "exact saved path.\n"
         "- BULK / FILTERED DOWNLOADS: for anything that is not exactly ONE named "
         "file (e.g. 'download the lectures of the last week', 'all slides from DV "
@@ -401,15 +408,19 @@ async def download_course_materials(
     named file: 'last week's lectures', 'all slides from DV and OS', 'every lab',
     'last two weeks of all my courses'. All filters combine with AND; leave a
     filter at its default to ignore it. Files are organised automatically under
-    save_dir (<Course>/, <Course>/Labs/Lab N/, <Course>/Assignments/Assignment N/).
+    save_dir (<Course>/, <Course>/Labs/Lab N/, <Course>/Assignments/Assignment N/):
+    never create those subfolders yourself, and files inside LMS folder resources
+    are filed the same way (no extra subfolder).
 
     Big jobs run in the background. If the result says the job is STILL RUNNING,
     call get_materials_job_status(job_id) about every 30 seconds until it reports
     the final summary, then tell the user what was saved / skipped / failed.
 
     Args:
-        save_dir: REQUIRED. Full path of the ROOT folder (inside the Filesystem
-            extension's allowed directories; call its list_allowed_directories first).
+        save_dir: REQUIRED. Full path of the ROOT folder: the allowed directory itself
+            (call the Filesystem extension's list_allowed_directories first), with no
+            extra subfolder like 'Downloads'. The course folders are created directly
+            inside it. Never the NUST_LMS_MCP project folder.
         courses: Course names/codes/abbreviations, e.g. ['DV', 'Operating Systems'].
             Omit, leave empty, or use ['all'] for EVERY course on the dashboard.
         period: Calendar preset: 'today', 'yesterday', 'this_week' (since Monday),
