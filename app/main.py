@@ -82,8 +82,8 @@ mcp = FastMCP(
         "and OS', 'last two weeks of every course', 'all labs', 'only the PDFs'), "
         "use download_course_materials, NOT download_course_material. It scans the "
         "chosen courses, applies every filter and downloads all matches in one go. "
-        "Map the user's words to arguments: courses=[...] (omit for every course); "
-        "last_weeks / last_days / period ('this_week', 'last_week', 'today', "
+        "Map the user's words to arguments: courses=[...] (omit for every IN-PROGRESS course; "
+        "only in-progress courses are ever used, never past/future ones); last_weeks / last_days / period ('this_week', 'last_week', 'today', "
         "'yesterday', 'this_month', 'last_month') / since+until (YYYY-MM-DD; call "
         "get_current_time first to turn relative dates into these); "
         "categories=['lectures'|'labs'|'assignments']; name_contains / name_excludes; "
@@ -422,7 +422,8 @@ async def download_course_materials(
             extra subfolder like 'Downloads'. The course folders are created directly
             inside it. Never the NUST_LMS_MCP project folder.
         courses: Course names/codes/abbreviations, e.g. ['DV', 'Operating Systems'].
-            Omit, leave empty, or use ['all'] for EVERY course on the dashboard.
+            Omit, leave empty, or use ['all'] for EVERY IN-PROGRESS course on the
+            dashboard (past, future and hidden courses are never included).
         period: Calendar preset: 'today', 'yesterday', 'this_week' (since Monday),
             'last_week' (previous Monday-Sunday), 'this_month', 'last_month'.
         last_days: Rolling window: uploaded in the last N days (incl. today).

@@ -543,8 +543,75 @@ class _LmsBrowserWorker:
             browser.close()
             playwright.stop()
 
+    _COURSES_VIEW = '[data-region="courses-view"]'
+
+    def _ensure_inprogress_view(self, page):
+        """Forces the dashboard 'Course overview' block to the 'In progress' filter.
+
+        STRICT: only in-progress courses may ever be used. The dashboard remembers
+        the last grouping the user picked (All / Past / Future / Starred ...), so
+        it is switched explicitly and then verified. Returns None when the view is
+        confirmed to be 'In progress', otherwise an error message (never falls
+        back to showing all courses).
+        """
+        view = page.locator(self._COURSES_VIEW).first
+        try:
+            view.wait_for(state="attached", timeout=15000)
+        except PlaywrightTimeoutError:
+            return "The 'Course overview' block was not found on the LMS dashboard."
+
+        if view.get_attribute("data-grouping") != "inprogress":
+            try:
+                page.locator("#groupingdropdown").click(timeout=10000)
+                page.locator(
+                    'a.dropdown-item[data-filter="grouping"][data-value="inprogress"]'
+                ).click(timeout=10000)
+                page.wait_for_function(
+                    """() => document.querySelector('[data-region="courses-view"]')
+                        ?.getAttribute('data-grouping') === 'inprogress'""",
+                    timeout=15000,
+                )
+            except PlaywrightError as error:
+                return (
+                    "Could not switch the LMS dashboard to the 'In progress' course "
+                    f"filter: {error}"
+                )
+
+        # The cards re-render asynchronously after a filter change: wait until the
+        # set of course ids stops changing so stale 'All' cards are never read.
+        read_ids = (
+            "() => Array.from(document.querySelectorAll("
+            "'[data-region=\"courses-view\"] [data-course-id].course-card'))"
+            ".map(card => card.dataset.courseId).sort().join(',')"
+        )
+        page.wait_for_timeout(800)
+        previous = None
+        for _ in range(20):
+            current = page.evaluate(read_ids)
+            if current == previous:
+                break
+            previous = current
+            page.wait_for_timeout(500)
+
+        grouping = page.locator(self._COURSES_VIEW).first.get_attribute(
+            "data-grouping"
+        )
+        active = page.locator("#groupingdropdown [data-active-item-text]").first
+        active_text = (active.inner_text().strip().lower() if active.count() else "")
+        if grouping != "inprogress" or (active_text and "in progress" not in active_text):
+            return (
+                "Refusing to continue: the LMS dashboard is not on the 'In progress' "
+                f"filter (grouping={grouping!r}, shown={active_text!r}). Only "
+                "in-progress courses are allowed."
+            )
+        return None
+
     def _get_courses(self, page):
-        """Reads every course on the LMS dashboard. Returns (courses, error)."""
+        """Reads the IN-PROGRESS courses on the LMS dashboard (and nothing else).
+
+        Returns (courses, error). Past / future / hidden courses are never
+        returned.
+        """
         if page.is_closed():
             return None, "The LMS tab was closed. Log in again before continuing."
 
@@ -556,11 +623,17 @@ class _LmsBrowserWorker:
         if page.locator("#login input#password").count():
             return None, "The LMS session has expired. Log in again before continuing."
 
-        course_links = page.locator('a.coursename[href*="/course/view.php"]')
+        problem = self._ensure_inprogress_view(page)
+        if problem:
+            return None, problem
+
+        course_links = page.locator(
+            self._COURSES_VIEW + ' a.coursename[href*="/course/view.php"]'
+        )
         try:
             course_links.first.wait_for(state="visible", timeout=15000)
         except PlaywrightTimeoutError:
-            return None, "No courses were found on the LMS dashboard."
+            return None, "No in-progress courses were found on the LMS dashboard."
 
         courses = course_links.evaluate_all(
             """links => {
