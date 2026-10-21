@@ -84,7 +84,7 @@ Then Claude does the rest: for a download it asks the Filesystem extension which
 
 ### Folder layout (automatic)
 
-`save_dir` is only the root. The server files each download itself:
+`save_dir` is only the root: pass the allowed directory itself (for example `E:\NUST_LMS`), with no extra `Downloads`-style subfolder. The course folders sit directly inside it, and the server files each download itself, for single files and bulk downloads alike:
 
 ```
 <save_dir>/<Course name>/                          lectures and other material
@@ -94,7 +94,7 @@ Then Claude does the rest: for a download it asks the Filesystem extension which
 <save_dir>/<Course name>/Submissions/Assignment 2/
 ```
 
-Folder names come from the LMS item name (`LAB 5 SUBMISSION-B` -> `Lab 5`). An item with a lab/assignment keyword but no number keeps its own name; other submissions go to `Submissions/<item name>`.
+Folder names come from the LMS item name (`LAB 5 SUBMISSION-B` -> `Lab 5`). If the item title has no number (e.g. an item called just `LAB`), the number is read from the real file name (`Lab 7.docx` -> `Lab 7`). A lab/assignment with no number anywhere keeps its own name; other submissions go to `Submissions/<item name>`. Files inside an LMS folder resource are filed the same way, with no extra subfolder.
 
 Nothing is saved to a default location. Paths must be full absolute paths. `save_dir` is created if missing, and a filename clash gets a ` (1)` suffix instead of overwriting.
 

@@ -10,6 +10,7 @@ thread-safe). Every public function below just queues a request to that thread
 and waits for the result, so they are safe to call from any thread.
 """
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -70,6 +71,11 @@ def _resolve_save_dir(save_dir: str) -> Path:
 
 
 _CATEGORY_RE = re.compile(r"\b(labs?|assignments?|assign|assgn|asg)(?![a-z])", re.I)
+# Same keywords, but for FILE names such as 'CS333_Lab_4_Process.docx' where the
+# keyword is glued to the rest with underscores (no \b boundary there).
+_FILENAME_CATEGORY_RE = re.compile(
+    r"(?<![a-z])(labs?|assignments?|assign|assgn|asg)(?![a-z])", re.I
+)
 
 
 def _safe_folder_name(name: str, max_len: int = 80) -> str:
@@ -78,25 +84,42 @@ def _safe_folder_name(name: str, max_len: int = 80) -> str:
     return name[:max_len].rstrip(" .") or "Untitled"
 
 
-def _classify_activity(item_name: str):
+def _classify_activity(item_name: str, filename: str = ""):
     """Returns (category, folder_label): category is 'lab', 'assignment' or None.
 
     'LAB 5 SUBMISSION-B' -> ('lab', 'Lab 5'); 'Assignment 02' -> ('assignment',
     'Assignment 2'); 'Lab Manual' (no number) -> ('lab', 'Lab Manual').
+
+    ``filename`` (optional, the real file name once the download starts) is only a
+    fallback for items whose TITLE has no number: an item titled just 'LAB' that
+    holds 'Lab 7.docx' is filed under 'Lab 7' instead of a folder called 'LAB'.
     """
     match = _CATEGORY_RE.search(item_name)
     if not match:
         return None, None
     category = "lab" if match.group(1).lower().startswith("lab") else "assignment"
+    label = "Lab" if category == "lab" else "Assignment"
     number = re.match(r"[^0-9]{0,20}?(\d+)", item_name[match.end():])
     if number:
-        label = "Lab" if category == "lab" else "Assignment"
         return category, f"{label} {int(number.group(1))}"
+    if filename:
+        file_match = _FILENAME_CATEGORY_RE.search(filename)
+        if file_match and (
+            ("lab" if file_match.group(1).lower().startswith("lab") else "assignment")
+            == category
+        ):
+            file_number = re.match(r"[^0-9]{0,20}?(\d+)", filename[file_match.end():])
+            if file_number:
+                return category, f"{label} {int(file_number.group(1))}"
     return category, _safe_folder_name(item_name)
 
 
 def _organized_dir(
-    root: Path, course_name: str, item_name: str, is_submission: bool
+    root: Path,
+    course_name: str,
+    item_name: str,
+    is_submission: bool,
+    filename: str = "",
 ) -> Path:
     """Where a download goes under the caller's root folder.
 
@@ -104,9 +127,12 @@ def _organized_dir(
     <root>/<Course>/Labs/Lab N/               lab manuals
     <root>/<Course>/Assignments/Assignment N/ assignment files
     <root>/<Course>/Submissions/<Lab N|Assignment N|item name>/  your submissions
+
+    ``filename`` is the real file name (known once the download starts); it only
+    helps number a lab/assignment whose item title has no number.
     """
     course_dir = root / _safe_folder_name(course_name)
-    category, folder = _classify_activity(item_name)
+    category, folder = _classify_activity(item_name, filename)
     if is_submission:
         return course_dir / "Submissions" / (folder or _safe_folder_name(item_name))
     if category == "lab":
@@ -117,14 +143,23 @@ def _organized_dir(
 
 
 def _download_destination(
-    filename: str, activity_name: str, download_dir: Path
+    filename: str,
+    activity_name: str,
+    download_dir: "Path | Callable[[str], Path]",
 ) -> Path:
+    """Picks a non-clashing path for a download.
+
+    ``download_dir`` is either a folder or a function(filename) -> folder, so the
+    final folder can depend on the real file name (see _organized_dir).
+    """
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(" .")
     if not filename:
         filename = re.sub(r"[^a-zA-Z0-9_-]+", "_", activity_name).strip("_")
     if not Path(filename).suffix:
         filename = f"{filename}.download"
 
+    if callable(download_dir):
+        download_dir = download_dir(filename)
     download_dir.mkdir(parents=True, exist_ok=True)
     destination = download_dir / filename
     suffix = destination.suffix
@@ -402,12 +437,17 @@ class _LmsBrowserWorker:
                             continue
 
                         if operation == "download_material":
-                            target_dir = _organized_dir(
-                                Path(extra["download_dir"]),
-                                course["name"],
-                                item["name"],
-                                False,
-                            )
+                            download_root = Path(extra["download_dir"])
+
+                            def target_dir(filename, _item=item, _course=course):
+                                return _organized_dir(
+                                    download_root,
+                                    _course["name"],
+                                    _item["name"],
+                                    False,
+                                    filename,
+                                )
+
                             destination = self._download_course_file(
                                 page, item, target_dir
                             )
@@ -984,10 +1024,18 @@ class _LmsBrowserWorker:
                 job.done_count += 1
                 continue
             try:
-                target_dir = _organized_dir(root, course["name"], item["name"], False)
+                # Every file lands in the architecture under the root:
+                #   <root>/<Course>/  (+ Labs/Lab N, Assignments/Assignment N)
+                # No extra subfolders (not even for LMS folder resources): their
+                # files are filed exactly like single files.
+                def target_dir(filename, _course=course, _item=item):
+                    return _organized_dir(
+                        root, _course["name"], _item["name"], False, filename
+                    )
+
                 if item["kind"] == "folder":
                     paths = self._download_folder_files(
-                        page, item, target_dir / _safe_folder_name(item["name"]), spec
+                        page, item, target_dir, spec
                     )
                 else:
                     paths = [self._download_course_file(page, item, target_dir)]
