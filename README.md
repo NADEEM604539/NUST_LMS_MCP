@@ -2,7 +2,7 @@
 
 MCP server version of the MyAgent LMS agent. Any MCP-capable chatbot (Claude Desktop, Cursor, etc.) can now log in to NUST LMS, open courses, download slides, and manage assignment submissions.
 
-## Tools (16) and resources (2)
+## Tools (19) and resources (2)
 
 | Tool | What it does | Safety |
 |---|---|---|
@@ -11,7 +11,10 @@ MCP server version of the MyAgent LMS agent. Any MCP-capable chatbot (Claude Des
 | `open_course_quiz(course_name, quiz_name)` | Opens a quiz page (does not start it) | read-only |
 | `open_course_submission(course_name, submission_name)` | Opens an assignment page | read-only |
 | `get_course_submission_details(...)` | Dates, status, grade, files, feedback | read-only |
-| `download_course_material(course_name, material_name, save_dir)` | Saves slides/files into `save_dir` | writes a local file |
+| `download_course_material(course_name, material_name, save_dir)` | Saves ONE named slide/file into `save_dir` | writes a local file |
+| `download_course_materials(save_dir, courses, period, last_weeks, ...)` | **Bulk, filtered download** of many files at once (see below) | writes local files |
+| `list_course_materials(...)` | Same filters, but only previews what would be downloaded | read-only |
+| `get_materials_job_status(job_id)` | Progress / final report of a bulk job that is still running | read-only |
 | `download_course_submission(course_name, submission_name, save_dir)` | Saves your already-submitted files into `save_dir` | writes a local file |
 | `upload_course_submission(course, name, file_path, replace_existing=False, topic="", apply_naming=True)` | Uploads the file at `file_path` under the name `<topic>_<CMS>_<CLASS>_<STUDENT_NAME>.<ext>` (renamed copy, original untouched); won't overwrite unless `replace_existing=True` | changes LMS |
 | `delete_course_submission(course, name, confirm=False)` | Removes your submission; does nothing unless `confirm=True` | irreversible |
@@ -26,6 +29,38 @@ MCP server version of the MyAgent LMS agent. Any MCP-capable chatbot (Claude Des
 |---|---|
 | `student://profile` | Student name, CMS ID, class |
 | `student://submission-rules` | The naming convention and header rules, with an example |
+
+## Bulk downloads with filters
+
+`download_course_materials` scans the courses you pick, applies every filter you give it, and downloads all matches in one run. Filters combine with AND; anything left at its default is ignored.
+
+| Filter | Meaning | Example |
+|---|---|---|
+| `courses` | Course names / codes / abbreviations. Omit or `['all']` = every course on the dashboard | `['DV', 'Operating Systems']` |
+| `last_weeks`, `last_days` | Rolling window ending now | `last_weeks=2` |
+| `period` | `today`, `yesterday`, `this_week`, `last_week` (previous Mon-Sun), `this_month`, `last_month` | `period='last_week'` |
+| `since`, `until` | Explicit dates (`YYYY-MM-DD`) | `since='2026-10-01'` |
+| `categories` | `lectures`, `labs`, `assignments` (decided from the item title) | `['labs']` |
+| `name_contains`, `name_excludes` | Keywords in the item title | `['lecture 5']` |
+| `sections` | Keywords in the course section title | `['Week 7']` |
+| `last_sections` | Only the newest N sections (weeks) of each course | `last_sections=2` |
+| `file_types` | `pdf`, `slides`, `word`, `excel`, `zip`, `image`, `video`, or an extension | `['pdf', 'slides']` |
+| `include_folders` | Also download the files inside LMS folders (default on) | |
+| `include_undated` | Also take items whose date could not be found (default off) | |
+| `skip_already_downloaded` | Skip items an earlier bulk run saved under the same `save_dir` (default on; tracked in `.lms_downloads.json`) | |
+| `limit` | Stop after N items | `limit=10` |
+
+Examples you can say to Claude: "download the lectures of the last week", "all slides from DV and OS from the last two weeks", "every lab from all my courses", "only the PDFs from this month".
+
+**How the date of a file is found** (first one that works wins):
+
+1. A date shown on the course page for that item.
+2. A week range in the section title (e.g. `14 October - 20 October`).
+3. The file's own upload time, read from the LMS response headers (`probe_dates`, on by default; a small extra request per file).
+
+Items with no determinable date are left out and reported, so nothing is silently dropped. Use `include_undated=True`, or `last_sections` / `sections`, when your courses name weeks like "Week 7" instead of using dates.
+
+**Long jobs:** MCP clients give up on a single tool call after a minute or so, so bulk jobs run in the background. The tool waits ~40 s and, if the job is still going, returns a job id; Claude then polls `get_materials_job_status` until the final summary (saved / skipped / failed) is ready. `list_course_materials` takes the same filters and downloads nothing, which is useful for checking what a filter catches first.
 
 ## Submission naming and header
 

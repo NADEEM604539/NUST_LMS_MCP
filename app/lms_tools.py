@@ -11,19 +11,24 @@ and waits for the result, so they are safe to call from any thread.
 """
 
 from concurrent.futures import Future
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+import json
 import os
 from pathlib import Path
 from queue import Queue
 import re
 import shutil
 from threading import Event, Lock, Thread
+import time
 from urllib.parse import parse_qs, urljoin, urlparse
+import uuid
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from app import student_profile
+from app import lms_filters, student_profile
 
 _lms_browser_worker = None
 _lms_browser_worker_lock = Lock()
@@ -207,6 +212,15 @@ class _LmsBrowserWorker:
         result = Future()
         self._requests.put((request, result))
         return result.result(timeout=300)
+
+    def submit_materials_job(self, job, spec, save_root) -> None:
+        """Queues a bulk list/download job and returns immediately.
+
+        The job object carries progress and the final report; callers wait on
+        ``job.finished`` instead of on a Future, so a long download never hits
+        the MCP client's per-call timeout.
+        """
+        self._requests.put((("materials_job", job, spec, save_root), Future()))
 
     def _run(self):
         playwright = None
@@ -457,6 +471,30 @@ class _LmsBrowserWorker:
                             f'Opened {item_type} "{item["name"]}" in course '
                             f'"{course["name"]}" in the existing LMS tab.'
                         )
+                    elif operation == "materials_job":
+                        _, job, spec, save_root = request
+                        if active_person is None or active_person not in pages:
+                            job.fail(
+                                "No LMS account is logged in yet. Log in first, "
+                                "then try again."
+                            )
+                            result.set_result(job.status)
+                            continue
+                        page = pages[active_person]
+                        if page.is_closed():
+                            pages.pop(active_person, None)
+                            active_person = None
+                            job.fail(
+                                "The LMS tab was closed. Log in again before "
+                                "continuing."
+                            )
+                            result.set_result(job.status)
+                            continue
+                        try:
+                            self._materials_job(page, job, spec, save_root)
+                        except Exception as job_error:
+                            job.fail(f"{type(job_error).__name__}: {job_error}")
+                        result.set_result(job.status)
                     else:
                         raise ValueError(f"Unknown LMS browser operation: {operation}")
                 except Exception as error:
@@ -465,7 +503,8 @@ class _LmsBrowserWorker:
             browser.close()
             playwright.stop()
 
-    def _open_course(self, page, course_query: str):
+    def _get_courses(self, page):
+        """Reads every course on the LMS dashboard. Returns (courses, error)."""
         if page.is_closed():
             return None, "The LMS tab was closed. Log in again before continuing."
 
@@ -497,6 +536,12 @@ class _LmsBrowserWorker:
                 });
             }"""
         )
+        return courses, None
+
+    def _open_course(self, page, course_query: str):
+        courses, message = self._get_courses(page)
+        if message:
+            return None, message
         course, message = _select_best_match(course_query, courses, "course")
         if message:
             return None, message
@@ -643,6 +688,347 @@ class _LmsBrowserWorker:
                 f"Download finished but the file was not found at {destination}."
             )
         return destination
+
+    # ------------------------------------------------------------------
+    # Bulk / filtered material downloads
+    # ------------------------------------------------------------------
+    def _collect_materials(self, page, course: dict, now: datetime) -> list[dict]:
+        """Opens a course page and lists every file / folder on it with metadata."""
+        page.goto(course["url"], wait_until="domcontentloaded", timeout=30000)
+        if page.locator("#login input#password").count():
+            raise RuntimeError(
+                "The LMS session has expired. Log in again before continuing."
+            )
+        cards = page.locator('.activity-item[data-region="activity-card"]')
+        try:
+            cards.first.wait_for(state="attached", timeout=15000)
+        except PlaywrightTimeoutError:
+            return []
+        raw_items = cards.evaluate_all(
+            r"""(cards, modulePaths) => cards.flatMap(card => {
+                const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+                const link = Array.from(card.querySelectorAll('a[href]')).find(anchor => {
+                    const path = new URL(anchor.href).pathname;
+                    return modulePaths.some(module => path.includes(module));
+                });
+                const name = card.dataset.activityname?.trim();
+                if (!link || !name) return [];
+                const section = card.closest(
+                    'li.section, [data-region="section"], .course-section'
+                );
+                const sectionName = clean(
+                    section?.dataset.sectionname
+                    || section?.querySelector(
+                        '.sectionname, [data-for="section_title"], h3'
+                    )?.innerText
+                );
+                const numberText = section?.dataset.number
+                    ?? (section?.id || '').replace(/^section-/, '');
+                const details = Array.from(card.querySelectorAll(
+                    '.resourcelinkdetails, .activity-information, '
+                    + '[data-region="activity-information"], .activity-dates'
+                )).map(element => clean(element.innerText)).filter(Boolean).join(' | ');
+                const icon = card.querySelector('img.activityicon, img.icon');
+                return [{
+                    name, url: link.href, sectionName, numberText, details,
+                    icon: icon ? icon.src : ''
+                }];
+            })""",
+            ["/mod/resource/", "/mod/folder/"],
+        )
+
+        items = []
+        seen_urls = set()
+        section_order: dict[str, int] = {}
+        for raw in raw_items:
+            if raw["url"] in seen_urls:
+                continue
+            seen_urls.add(raw["url"])
+            parsed_url = urlparse(raw["url"])
+            cmid = parse_qs(parsed_url.query).get("id", [""])[0]
+            section_name = raw.get("sectionName") or ""
+            number_text = str(raw.get("numberText") or "")
+            if number_text.isdigit():
+                section_number = int(number_text)
+            else:
+                section_number = section_order.setdefault(
+                    section_name, len(section_order)
+                )
+            icon_name = (raw.get("icon") or "").rsplit("/", 1)[-1]
+            details = raw.get("details") or ""
+            page_date = lms_filters.parse_datetime_text(details, now)
+            items.append(
+                {
+                    "name": raw["name"],
+                    "url": raw["url"],
+                    "cmid": cmid,
+                    "kind": "folder" if "/mod/folder/" in parsed_url.path else "file",
+                    "section_name": section_name,
+                    "section_number": section_number,
+                    "type_hint": f"{details} {icon_name}",
+                    "date": page_date,
+                    "date_source": "page" if page_date else "",
+                    "section_range": lms_filters.parse_section_range(
+                        section_name, now
+                    ),
+                }
+            )
+        return items
+
+    def _probe_last_modified(self, page, item: dict):
+        """Reads a file's upload time from the LMS response headers.
+
+        Used only when neither the course page nor the section title shows a
+        date. A temporary tab opens the file, notes the Last-Modified header of
+        the /pluginfile.php/ response and is closed again (the download is
+        abandoned). Returns a naive local datetime or None.
+        """
+        if item["kind"] != "file":
+            return None
+        stamps: list[str] = []
+
+        def on_response(response):
+            try:
+                if "/pluginfile.php/" in response.url or "/draftfile.php/" in response.url:
+                    value = response.headers.get("last-modified")
+                    if value:
+                        stamps.append(value)
+            except Exception:
+                pass
+
+        probe = page.context.new_page()
+        probe.on("response", on_response)
+        try:
+            try:
+                probe.goto(item["url"], wait_until="commit", timeout=30000)
+            except PlaywrightError as error:
+                if "Download is starting" not in str(error):
+                    return None
+            for _ in range(100):
+                if stamps:
+                    break
+                probe.wait_for_timeout(100)
+            if not stamps:
+                return None
+            try:
+                return parsedate_to_datetime(stamps[0]).astimezone().replace(tzinfo=None)
+            except (TypeError, ValueError):
+                return None
+        except Exception:
+            return None
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+    def _apply_date_filter(self, page, items: list[dict], spec, job):
+        """Keeps items inside the date window. Returns (kept, undated_count)."""
+        kept = []
+        undated = 0
+        to_probe = [
+            item
+            for item in items
+            if spec.probe_dates and lms_filters.date_status(item, spec) is None
+        ]
+        if to_probe:
+            job.log(
+                f"  No date on the page for {len(to_probe)} item(s); "
+                "reading their upload time from the LMS..."
+            )
+        for item in items:
+            status = lms_filters.date_status(item, spec)
+            if status is None and spec.probe_dates:
+                probed = self._probe_last_modified(page, item)
+                if probed is not None:
+                    item["date"] = probed
+                    item["date_source"] = "file"
+                    status = lms_filters.date_status(item, spec)
+            if status is None:
+                if spec.include_undated:
+                    kept.append(item)
+                else:
+                    undated += 1
+            elif status:
+                kept.append(item)
+        return kept, undated
+
+    def _download_folder_files(
+        self, page, item: dict, target_dir: Path, spec
+    ) -> list[Path]:
+        """Downloads every file inside an LMS folder resource."""
+        page.goto(item["url"], wait_until="domcontentloaded", timeout=30000)
+        links = page.locator(
+            '.foldertree a[href*="/pluginfile.php/"], '
+            '.filemanager a[href*="/pluginfile.php/"]'
+        ).evaluate_all(
+            "links => links.map(a => ({name: (a.innerText || '').trim(), url: a.href}))"
+        )
+        if not links:
+            raise RuntimeError(f'No files were found inside folder "{item["name"]}".')
+        paths = []
+        seen = set()
+        for link in links:
+            if link["url"] in seen:
+                continue
+            seen.add(link["url"])
+            suffix = Path(urlparse(link["url"]).path).suffix.lower().lstrip(".")
+            if spec.file_exts and suffix and suffix not in spec.file_exts:
+                continue
+            paths.append(
+                self._download_url(
+                    page, link["url"], link["name"] or item["name"], target_dir
+                )
+            )
+        return paths
+
+    def _materials_job(self, page, job, spec, save_root) -> None:
+        """Scans the chosen courses, applies the filters, lists or downloads."""
+        job.status = "running"
+        now = datetime.now()
+        courses, message = self._get_courses(page)
+        if message:
+            job.fail(message)
+            return
+
+        if spec.all_courses:
+            selected = list(courses)
+        else:
+            selected = []
+            for query in spec.courses:
+                course, message = _select_best_match(query, courses, "course")
+                if message:
+                    job.notes.append(message)
+                elif course not in selected:
+                    selected.append(course)
+        for note in job.notes:
+            job.log(note)
+        if not selected:
+            job.fail("No matching course to scan. " + " ".join(job.notes))
+            return
+
+        plan: list[tuple[dict, dict]] = []
+        undated_total = 0
+        scanned_total = 0
+        for course in selected:
+            job.log(f'Scanning "{course["name"]}"')
+            try:
+                items = self._collect_materials(page, course, now)
+            except Exception as error:
+                job.log(f"  Could not read this course: {error}")
+                job.notes.append(f'Could not read "{course["name"]}": {error}')
+                continue
+            scanned_total += len(items)
+            items = lms_filters.static_filter(items, spec, _classify_activity)
+            items = lms_filters.latest_sections(items, spec.last_sections)
+            if spec.has_window and items:
+                items, undated = self._apply_date_filter(page, items, spec, job)
+                undated_total += undated
+            job.log(f"  {len(items)} matching item(s)")
+            plan.extend((course, item) for item in items)
+            if spec.limit and len(plan) >= spec.limit:
+                break
+        if spec.limit:
+            plan = plan[: spec.limit]
+        job.total = len(plan)
+
+        header = f"Filters -> {spec.describe()}"
+        footer = []
+        if undated_total:
+            footer.append(
+                f"{undated_total} item(s) were left out because no upload date could "
+                "be determined for them (the course page shows none and reading "
+                "the file's date failed). Re-run with include_undated=True to "
+                "include them, or use last_sections / sections instead of a date."
+            )
+        footer.extend(job.notes)
+
+        if job.dry_run or not plan:
+            lines = [header, f"Scanned {scanned_total} file/folder item(s) in "
+                     f"{len(selected)} course(s); {len(plan)} match."]
+            current = None
+            for course, item in plan:
+                if course["name"] != current:
+                    current = course["name"]
+                    lines.append(f"\n{current}")
+                lines.append("  - " + lms_filters.describe_item(item))
+            if job.dry_run and plan:
+                lines.append(
+                    "\nNothing was downloaded. Call download_course_materials "
+                    "with the same filters to download these."
+                )
+            lines.extend(footer)
+            job.finish("\n".join(lines))
+            return
+
+        self._download_plan(page, job, plan, spec, Path(save_root), header, footer)
+
+    def _download_plan(
+        self, page, job, plan, spec, root: Path, header: str, footer: list[str]
+    ) -> None:
+        manifest = _load_manifest(root)
+        saved: list[str] = []
+        skipped_known: list[str] = []
+        skipped_type: list[str] = []
+        failed: list[str] = []
+        for index, (course, item) in enumerate(plan, 1):
+            job.log(f'[{index}/{job.total}] {course["name"]} / {item["name"]}')
+            key = item["cmid"] or item["url"]
+            known = manifest.get(key)
+            if (
+                spec.skip_downloaded
+                and known
+                and all(Path(path).is_file() for path in known)
+            ):
+                skipped_known.append(item["name"])
+                job.done_count += 1
+                continue
+            try:
+                target_dir = _organized_dir(root, course["name"], item["name"], False)
+                if item["kind"] == "folder":
+                    paths = self._download_folder_files(
+                        page, item, target_dir / _safe_folder_name(item["name"]), spec
+                    )
+                else:
+                    paths = [self._download_course_file(page, item, target_dir)]
+                kept = []
+                for path in paths:
+                    extension = path.suffix.lower().lstrip(".")
+                    if spec.file_exts and extension not in spec.file_exts:
+                        path.unlink(missing_ok=True)
+                        skipped_type.append(f"{path.name} (.{extension or '?'})")
+                    else:
+                        kept.append(path)
+                if kept:
+                    saved.extend(str(path) for path in kept)
+                    manifest[key] = [str(path) for path in kept]
+                    _save_manifest(root, manifest)
+                job.done_count += 1
+            except Exception as error:
+                message = str(error).strip() or type(error).__name__
+                failed.append(f'{course["name"]} / {item["name"]}: {message}')
+                job.failed_count += 1
+                job.log(f"  FAILED: {message}")
+
+        lines = [header, f"Downloaded {len(saved)} file(s) into {root}"]
+        lines.extend(f"  - {path}" for path in saved[:80])
+        if len(saved) > 80:
+            lines.append(f"  ... and {len(saved) - 80} more")
+        if skipped_known:
+            lines.append(
+                f"Skipped {len(skipped_known)} item(s) already downloaded earlier "
+                "(set skip_already_downloaded=False to fetch them again)."
+            )
+        if skipped_type:
+            lines.append(
+                f"Discarded {len(skipped_type)} file(s) that did not match the "
+                "requested file type: " + "; ".join(skipped_type[:20])
+            )
+        if failed:
+            lines.append(f"FAILED ({len(failed)}):")
+            lines.extend(f"  - {entry}" for entry in failed[:30])
+        lines.extend(footer)
+        job.finish("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Assignment submissions (download / delete / upload)
@@ -1120,3 +1506,135 @@ def upload_submission(
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
     return rename_note + result
+
+
+# ----------------------------------------------------------------------
+# Bulk / filtered material downloads (list + download as background jobs)
+# ----------------------------------------------------------------------
+_MANIFEST_NAME = ".lms_downloads.json"
+
+
+def _load_manifest(root: Path) -> dict:
+    """Remembers which LMS items were already saved under ``root``."""
+    try:
+        data = json.loads((root / _MANIFEST_NAME).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_manifest(root: Path, manifest: dict) -> None:
+    try:
+        (root / _MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=1), encoding="utf-8"
+        )
+    except OSError:
+        pass  # losing the manifest only means a file may be fetched twice
+
+
+class _MaterialsJob:
+    """Progress + result of one list/download run, shared with the worker thread."""
+
+    def __init__(self, dry_run: bool):
+        self.id = uuid.uuid4().hex[:8]
+        self.dry_run = dry_run
+        self.status = "queued"
+        self.started = time.time()
+        self.total = 0
+        self.done_count = 0
+        self.failed_count = 0
+        self.notes: list[str] = []
+        self.report = ""
+        self.finished = Event()
+        self._log: list[str] = []
+        self._lock = Lock()
+
+    def log(self, message: str) -> None:
+        with self._lock:
+            self._log.append(message)
+            del self._log[:-200]
+
+    def finish(self, report: str) -> None:
+        self.report = report
+        self.status = "done"
+        self.finished.set()
+
+    def fail(self, message: str) -> None:
+        self.report = f"FAILED: {message}"
+        self.status = "failed"
+        self.finished.set()
+
+    def snapshot(self) -> str:
+        elapsed = int(time.time() - self.started)
+        if self.finished.is_set():
+            return f"{self.report}\n\n(job {self.id}, finished in {elapsed}s)"
+        with self._lock:
+            tail = "\n".join(self._log[-6:]) or "starting..."
+        progress = (
+            f"{self.done_count}/{self.total} files processed"
+            + (f", {self.failed_count} failed" if self.failed_count else "")
+            if self.total
+            else "scanning courses"
+        )
+        return (
+            f"Job {self.id} is STILL RUNNING after {elapsed}s ({progress}). "
+            f"Latest progress:\n{tail}\n\n"
+            f"Call get_materials_job_status(job_id='{self.id}') again in about "
+            "30 seconds to get the result."
+        )
+
+
+_jobs: dict[str, _MaterialsJob] = {}
+_jobs_lock = Lock()
+
+
+def _register_job(job: _MaterialsJob) -> None:
+    with _jobs_lock:
+        _jobs[job.id] = job
+        while len(_jobs) > 20:
+            _jobs.pop(next(iter(_jobs)))
+
+
+def _wait_for_job(job: _MaterialsJob, wait_seconds: int) -> str:
+    wait = max(0, min(int(wait_seconds or 0), 50))
+    job.finished.wait(timeout=wait)
+    return job.snapshot()
+
+
+def start_materials_job(
+    dry_run: bool,
+    save_dir: str = "",
+    wait_seconds: int = 40,
+    **filters,
+) -> str:
+    """Starts a filtered list (dry_run) or download of course materials.
+
+    ``filters`` are passed to lms_filters.build_spec (courses, period,
+    last_days, last_weeks, since, until, name_contains, name_excludes,
+    categories, sections, last_sections, file_types, include_undated,
+    include_folders, skip_already_downloaded, probe_dates, limit).
+    Waits up to ``wait_seconds`` for the result; longer jobs keep running in
+    the background and are followed up with materials_job_status().
+    """
+    spec = lms_filters.build_spec(datetime.now(), **filters)
+    save_root = None if dry_run else str(_resolve_save_dir(save_dir))
+    job = _MaterialsJob(dry_run)
+    _register_job(job)
+    _get_lms_browser_worker().submit_materials_job(job, spec, save_root)
+    return _wait_for_job(job, wait_seconds)
+
+
+def materials_job_status(job_id: str = "", wait_seconds: int = 20) -> str:
+    """Progress / final report of a bulk job (the latest one if job_id is empty)."""
+    with _jobs_lock:
+        if job_id.strip():
+            job = _jobs.get(job_id.strip())
+        else:
+            job = next(reversed(_jobs.values()), None) if _jobs else None
+    if job is None:
+        known = ", ".join(_jobs) or "none"
+        raise ValueError(
+            f'No bulk job found{" with id " + job_id if job_id.strip() else ""}. '
+            f"Known job ids: {known}."
+        )
+    return _wait_for_job(job, wait_seconds)
