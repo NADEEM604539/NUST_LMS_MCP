@@ -70,6 +70,24 @@ mcp = FastMCP(
         "hold lab manuals and assignment files; <Course>/Submissions/<Lab N or "
         "Assignment N>/ holds the user's own submitted work. The tool result gives the "
         "exact saved path.\n"
+        "- BULK / FILTERED DOWNLOADS: for anything that is not exactly ONE named "
+        "file (e.g. 'download the lectures of the last week', 'all slides from DV "
+        "and OS', 'last two weeks of every course', 'all labs', 'only the PDFs'), "
+        "use download_course_materials, NOT download_course_material. It scans the "
+        "chosen courses, applies every filter and downloads all matches in one go. "
+        "Map the user's words to arguments: courses=[...] (omit for every course); "
+        "last_weeks / last_days / period ('this_week', 'last_week', 'today', "
+        "'yesterday', 'this_month', 'last_month') / since+until (YYYY-MM-DD; call "
+        "get_current_time first to turn relative dates into these); "
+        "categories=['lectures'|'labs'|'assignments']; name_contains / name_excludes; "
+        "sections=['Week 5']; last_sections=N (newest N weeks of each course); "
+        "file_types=['pdf','slides','word','excel','zip']. If unsure what a filter "
+        "will catch, run list_course_materials first (same filters, downloads "
+        "nothing). Large jobs run in the background: if a result says the job is "
+        "STILL RUNNING, call get_materials_job_status(job_id) about every 30 "
+        "seconds until it returns the final report, then summarise it for the user. "
+        "If the report says items were left out because their date could not be "
+        "determined, tell the user and offer include_undated=True or last_sections.\n"
         "- delete_course_submission is irreversible and upload_course_submission can "
         "replace work: only use confirm=True / replace_existing=True after the user "
         "has explicitly said so for that exact assignment.\n"
@@ -296,6 +314,170 @@ async def download_course_material(
             explains how to install/configure the Filesystem extension.
     """
     return await _run(lms_tools.download_material, course_name, material_name, save_dir)
+
+
+@mcp.tool(
+    title="List course materials (filtered preview)",
+    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def list_course_materials(
+    courses: list[str] | None = None,
+    period: str = "",
+    last_days: int = 0,
+    last_weeks: int = 0,
+    since: str = "",
+    until: str = "",
+    name_contains: list[str] | None = None,
+    name_excludes: list[str] | None = None,
+    categories: list[str] | None = None,
+    sections: list[str] | None = None,
+    last_sections: int = 0,
+    file_types: list[str] | None = None,
+    include_undated: bool = False,
+    include_folders: bool = True,
+    probe_dates: bool = True,
+    limit: int = 0,
+) -> str:
+    """Previews which course files match the filters WITHOUT downloading anything.
+
+    Takes exactly the same filters as download_course_materials (see that tool for
+    what each means). Use it to check what a filter will catch, to see section
+    names and dates, or when the user just asks 'what was uploaded last week?'.
+    Scans every selected course, so it can take a while: if the result says the
+    job is still running, call get_materials_job_status(job_id) until it finishes.
+    """
+    return await _run(
+        lms_tools.start_materials_job,
+        True,
+        "",
+        45,
+        courses=courses,
+        period=period,
+        last_days=last_days,
+        last_weeks=last_weeks,
+        since=since,
+        until=until,
+        name_contains=name_contains,
+        name_excludes=name_excludes,
+        categories=categories,
+        sections=sections,
+        last_sections=last_sections,
+        file_types=file_types,
+        include_undated=include_undated,
+        include_folders=include_folders,
+        probe_dates=probe_dates,
+        limit=limit,
+    )
+
+
+@mcp.tool(
+    title="Download course materials in bulk (filters)",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
+                 "openWorldHint": True},
+)
+async def download_course_materials(
+    save_dir: str,
+    courses: list[str] | None = None,
+    period: str = "",
+    last_days: int = 0,
+    last_weeks: int = 0,
+    since: str = "",
+    until: str = "",
+    name_contains: list[str] | None = None,
+    name_excludes: list[str] | None = None,
+    categories: list[str] | None = None,
+    sections: list[str] | None = None,
+    last_sections: int = 0,
+    file_types: list[str] | None = None,
+    include_undated: bool = False,
+    include_folders: bool = True,
+    skip_already_downloaded: bool = True,
+    probe_dates: bool = True,
+    limit: int = 0,
+) -> str:
+    """Downloads MANY course files at once: every file that matches all the filters given.
+
+    Use this (not download_course_material) whenever the request is not exactly one
+    named file: 'last week's lectures', 'all slides from DV and OS', 'every lab',
+    'last two weeks of all my courses'. All filters combine with AND; leave a
+    filter at its default to ignore it. Files are organised automatically under
+    save_dir (<Course>/, <Course>/Labs/Lab N/, <Course>/Assignments/Assignment N/).
+
+    Big jobs run in the background. If the result says the job is STILL RUNNING,
+    call get_materials_job_status(job_id) about every 30 seconds until it reports
+    the final summary, then tell the user what was saved / skipped / failed.
+
+    Args:
+        save_dir: REQUIRED. Full path of the ROOT folder (inside the Filesystem
+            extension's allowed directories; call its list_allowed_directories first).
+        courses: Course names/codes/abbreviations, e.g. ['DV', 'Operating Systems'].
+            Omit, leave empty, or use ['all'] for EVERY course on the dashboard.
+        period: Calendar preset: 'today', 'yesterday', 'this_week' (since Monday),
+            'last_week' (previous Monday-Sunday), 'this_month', 'last_month'.
+        last_days: Rolling window: uploaded in the last N days (incl. today).
+        last_weeks: Rolling window: uploaded in the last N weeks (N*7 days).
+            'the last week' / 'last two weeks' -> 1 / 2.
+        since: Only items uploaded on/after this date, YYYY-MM-DD.
+        until: Only items uploaded on/before this date, YYYY-MM-DD.
+        name_contains: Keep items whose title contains ANY of these words,
+            e.g. ['lecture 5', 'week 3'].
+        name_excludes: Drop items whose title contains any of these words.
+        categories: Any of 'lectures' (slides/notes/other material), 'labs',
+            'assignments'. Decided from the item title.
+        sections: Keep items whose course SECTION title contains any of these,
+            e.g. ['Week 7'].
+        last_sections: Only the newest N sections (weeks) of each course that
+            contain matching items. Good fallback when upload dates are unavailable.
+        file_types: 'pdf', 'slides' (ppt/pptx), 'word', 'excel', 'zip', 'image',
+            'video', or a raw extension like 'py'.
+        include_undated: Also take items whose date could not be determined
+            (default False: they are skipped and reported).
+        include_folders: Also download the files inside LMS folder resources.
+        skip_already_downloaded: Do not fetch an item again if an earlier bulk run
+            already saved it under save_dir (default True).
+        probe_dates: When the course page shows no date, read each file's upload
+            time from the LMS (a little slower but accurate). Default True.
+        limit: Stop after this many items (0 = no limit).
+    """
+    return await _run(
+        lms_tools.start_materials_job,
+        False,
+        save_dir,
+        40,
+        courses=courses,
+        period=period,
+        last_days=last_days,
+        last_weeks=last_weeks,
+        since=since,
+        until=until,
+        name_contains=name_contains,
+        name_excludes=name_excludes,
+        categories=categories,
+        sections=sections,
+        last_sections=last_sections,
+        file_types=file_types,
+        include_undated=include_undated,
+        include_folders=include_folders,
+        skip_already_downloaded=skip_already_downloaded,
+        probe_dates=probe_dates,
+        limit=limit,
+    )
+
+
+@mcp.tool(
+    title="Bulk job status",
+    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
+)
+async def get_materials_job_status(job_id: str = "", wait_seconds: int = 25) -> str:
+    """Progress or final report of a list_course_materials / download_course_materials job.
+
+    Call it again every ~30 seconds while it says the job is still running.
+
+    Args:
+        job_id: The job id from the earlier result. Empty = the most recent job.
+        wait_seconds: How long to wait for it to finish before answering (max 50).
+    """
+    return await _run(lms_tools.materials_job_status, job_id, wait_seconds)
 
 
 @mcp.tool(
