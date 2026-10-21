@@ -64,6 +64,12 @@ mcp = FastMCP(
         "error, tell the user to install the Filesystem extension and add the folder "
         "under 'Allowed Directories', then retry. Never guess a path and never use a "
         "default location: there is none.\n"
+        "- Downloads are auto-organised under save_dir, so pass only the ROOT folder "
+        "and never create course/lab subfolders yourself: <Course>/ holds lectures and "
+        "other material; <Course>/Labs/Lab N/ and <Course>/Assignments/Assignment N/ "
+        "hold lab manuals and assignment files; <Course>/Submissions/<Lab N or "
+        "Assignment N>/ holds the user's own submitted work. The tool result gives the "
+        "exact saved path.\n"
         "- delete_course_submission is irreversible and upload_course_submission can "
         "replace work: only use confirm=True / replace_existing=True after the user "
         "has explicitly said so for that exact assignment.\n"
@@ -280,8 +286,10 @@ async def download_course_material(
     Args:
         course_name: Course name, course code, or abbreviation.
         material_name: Slide, document, or resource title to download.
-        save_dir: REQUIRED. Full path of the folder to save into, e.g.
-            'E:/Labs/Downloads'. Choose a folder inside the Filesystem extension's
+        save_dir: REQUIRED. Full path of the ROOT folder, e.g. 'E:/Labs/Downloads'.
+            The tool files the download itself: <Course>/ for lectures and other
+            material, <Course>/Labs/Lab N/ for lab manuals, <Course>/Assignments/
+            Assignment N/ for assignment files. Choose a folder inside the Filesystem extension's
             allowed directories (call its list_allowed_directories first) so the
             file can be opened afterwards. Created if missing; a name clash gets a
             ' (1)' suffix, never overwrites. If this is empty or invalid the tool
@@ -303,8 +311,9 @@ async def download_course_submission(
     Args:
         course_name: Course name, course code, or abbreviation.
         submission_name: Assignment/submission title, e.g. 'LAB 5 SUBMISSION-B'.
-        save_dir: REQUIRED. Full path of the folder to save the files into, e.g.
-            'E:/Labs/Downloads'. Choose a folder inside the Filesystem extension's
+        save_dir: REQUIRED. Full path of the ROOT folder, e.g. 'E:/Labs/Downloads'.
+            Files go to <Course>/Submissions/<Lab N or Assignment N>/ inside it,
+            created automatically. Choose a folder inside the Filesystem extension's
             allowed directories (call its list_allowed_directories first) so the
             files can be opened afterwards. Created if missing; a name clash gets a
             ' (1)' suffix, never overwrites. If this is empty or invalid the tool

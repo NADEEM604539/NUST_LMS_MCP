@@ -64,6 +64,53 @@ def _resolve_save_dir(save_dir: str) -> Path:
     return path.resolve()
 
 
+_CATEGORY_RE = re.compile(r"\b(labs?|assignments?|assign|assgn|asg)(?![a-z])", re.I)
+
+
+def _safe_folder_name(name: str, max_len: int = 80) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:max_len].rstrip(" .") or "Untitled"
+
+
+def _classify_activity(item_name: str):
+    """Returns (category, folder_label): category is 'lab', 'assignment' or None.
+
+    'LAB 5 SUBMISSION-B' -> ('lab', 'Lab 5'); 'Assignment 02' -> ('assignment',
+    'Assignment 2'); 'Lab Manual' (no number) -> ('lab', 'Lab Manual').
+    """
+    match = _CATEGORY_RE.search(item_name)
+    if not match:
+        return None, None
+    category = "lab" if match.group(1).lower().startswith("lab") else "assignment"
+    number = re.match(r"[^0-9]{0,20}?(\d+)", item_name[match.end():])
+    if number:
+        label = "Lab" if category == "lab" else "Assignment"
+        return category, f"{label} {int(number.group(1))}"
+    return category, _safe_folder_name(item_name)
+
+
+def _organized_dir(
+    root: Path, course_name: str, item_name: str, is_submission: bool
+) -> Path:
+    """Where a download goes under the caller's root folder.
+
+    <root>/<Course>/                          lectures and other material
+    <root>/<Course>/Labs/Lab N/               lab manuals
+    <root>/<Course>/Assignments/Assignment N/ assignment files
+    <root>/<Course>/Submissions/<Lab N|Assignment N|item name>/  your submissions
+    """
+    course_dir = root / _safe_folder_name(course_name)
+    category, folder = _classify_activity(item_name)
+    if is_submission:
+        return course_dir / "Submissions" / (folder or _safe_folder_name(item_name))
+    if category == "lab":
+        return course_dir / "Labs" / folder
+    if category == "assignment":
+        return course_dir / "Assignments" / folder
+    return course_dir
+
+
 def _download_destination(
     filename: str, activity_name: str, download_dir: Path
 ) -> Path:
@@ -341,8 +388,14 @@ class _LmsBrowserWorker:
                             continue
 
                         if operation == "download_material":
+                            target_dir = _organized_dir(
+                                Path(extra["download_dir"]),
+                                course["name"],
+                                item["name"],
+                                False,
+                            )
                             destination = self._download_course_file(
-                                page, item, Path(extra["download_dir"])
+                                page, item, target_dir
                             )
                             result.set_result(
                                 f'Downloaded "{item["name"]}" from course '
@@ -351,8 +404,14 @@ class _LmsBrowserWorker:
                             continue
 
                         if operation == "download_submission":
+                            target_dir = _organized_dir(
+                                Path(extra["download_dir"]),
+                                course["name"],
+                                item["name"],
+                                True,
+                            )
                             paths = self._download_submission_files(
-                                page, item, Path(extra["download_dir"])
+                                page, item, target_dir
                             )
                             if not paths:
                                 result.set_result(
