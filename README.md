@@ -128,8 +128,8 @@ Edit `claude_desktop_config.json` (Settings > Developer > Edit Config):
 {
   "mcpServers": {
     "nust-lms": {
-      "command": "YOUR_Directory_PATH\\NUST_LMS_MCP\\venv\\Scripts\\python.exe",
-      "args": ["YOUR_Directory_PATH\\NUST_LMS_MCP\\app\\main.py"]
+      "command": "E:\\Agentic AI projects\\NUST_LMS_MCP\\venv\\Scripts\\python.exe",
+      "args": ["E:\\Agentic AI projects\\NUST_LMS_MCP\\app\\main.py"]
     }
   }
 }
