@@ -47,6 +47,20 @@ Downloads and uploads happen on real folders, and the **Filesystem extension** d
 
 Then Claude does the rest: for a download it asks the Filesystem extension which folders are allowed, passes one as `save_dir`, and checks the saved file afterwards; for an upload it finds your file with the Filesystem tools and passes the exact path as `file_path`. If a path is missing or wrong, the tool's error tells Claude (and you) to set the extension up.
 
+### Folder layout (automatic)
+
+`save_dir` is only the root. The server files each download itself:
+
+```
+<save_dir>/<Course name>/                          lectures and other material
+<save_dir>/<Course name>/Labs/Lab 5/               lab manuals
+<save_dir>/<Course name>/Assignments/Assignment 2/ assignment files
+<save_dir>/<Course name>/Submissions/Lab 5/        your own submitted work
+<save_dir>/<Course name>/Submissions/Assignment 2/
+```
+
+Folder names come from the LMS item name (`LAB 5 SUBMISSION-B` -> `Lab 5`). An item with a lab/assignment keyword but no number keeps its own name; other submissions go to `Submissions/<item name>`.
+
 Nothing is saved to a default location. Paths must be full absolute paths. `save_dir` is created if missing, and a filename clash gets a ` (1)` suffix instead of overwriting.
 
 ## Setup
